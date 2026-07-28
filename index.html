@@ -198,6 +198,10 @@
       <input type="range" id="slider-nature" min="0" max="100" value="40">
     </div>
     <div class="slider-row">
+      <label>Deep Drone <span class="val" id="val-drone">40%</span></label>
+      <input type="range" id="slider-drone" min="0" max="100" value="40">
+    </div>
+    <div class="slider-row">
       <label>Master <span class="val" id="val-master">80%</span></label>
       <input type="range" id="slider-master" min="0" max="100" value="80">
     </div>
@@ -253,10 +257,11 @@
   let toneOsc = null, toneGain = null;
   let pad = null;       // { oscs, preFilter, filter, lfo, lfoDepth, dry, wet, delay, fbGain, fbFilter, out }
   let binaural = null;  // { leftOsc, rightOsc, panL, panR, out }
+  let deepDrone = null; // sub sine + sub triangle + granular choir + pink noise -> slow filter -> shimmer reverb -> tape saturation -> stereo widener
   let nature = null;    // current active nature chain: { type, out, sources, stopFn }
   let noiseBuffers = null;
 
-  const sliderVals = { tone: 0.8, pad: 0.35, nature: 0.4, master: 0.8 };
+  const sliderVals = { tone: 0.8, pad: 0.35, nature: 0.4, master: 0.8, drone: 0.4 };
   const binauralDiff = { value: 5 };
 
   function ctx() { return audioCtx; }
@@ -554,6 +559,223 @@
     if (binaural) {
       smoothSet(binaural.rightOsc.frequency, 432 + binauralDiff.value, 0.5);
     }
+  }
+
+  // ---------------- Layer 4: Deep Drone ----------------
+  // Sine (50 Hz) + triangle (-1 octave) + granular choir + low pink noise
+  //   -> slow lowpass -> huge shimmer reverb -> tape saturation -> stereo widener
+  const CHOIR_NOTES = [NOTE.D4, NOTE.F3 * 2, NOTE.A3 * 2, NOTE.D4 * 2]; // D4, F4, A4 (432), D5
+
+  function makeTapeCurve(amount) {
+    const n = 1024;
+    const curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      curve[i] = Math.tanh(amount * x) / Math.tanh(amount);
+    }
+    return curve;
+  }
+
+  // Full-wave rectification doubles a signal's fundamental frequency (+1 octave).
+  // A real shimmer reverb pitch-shifts the tail with a phase vocoder, which needs
+  // an AudioWorklet; this is a cheap, glitch-free stand-in that recirculates in
+  // the feedback loop to build the same "ascending, glimmering tail" character.
+  function makeRectifierCurve() {
+    const n = 1024;
+    const curve = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * 2 - 1;
+      curve[i] = Math.abs(x) * 2 - 1;
+    }
+    return curve;
+  }
+
+  function startDeepDrone() {
+    const out = audioCtx.createGain();
+    out.gain.value = 0;
+    out.connect(masterGain);
+
+    const preFilter = audioCtx.createGain();
+    preFilter.gain.value = 1;
+
+    const subSine = audioCtx.createOscillator();
+    subSine.type = "sine";
+    subSine.frequency.value = 50;
+    const subSineGain = audioCtx.createGain(); subSineGain.gain.value = 0.5;
+    subSine.connect(subSineGain); subSineGain.connect(preFilter);
+    subSine.start();
+
+    const subTri = audioCtx.createOscillator();
+    subTri.type = "triangle";
+    subTri.frequency.value = 25; // one octave below the 50 Hz sine
+    const subTriGain = audioCtx.createGain(); subTriGain.gain.value = 0.32;
+    subTri.connect(subTriGain); subTriGain.connect(preFilter);
+    subTri.start();
+
+    const noiseSrc = makeLoopSource(noiseBuffers.pink);
+    const noiseFilter = audioCtx.createBiquadFilter();
+    noiseFilter.type = "lowpass"; noiseFilter.frequency.value = 1000;
+    const noiseGain = audioCtx.createGain(); noiseGain.gain.value = 0.05;
+    noiseSrc.connect(noiseFilter); noiseFilter.connect(noiseGain); noiseGain.connect(preFilter);
+    noiseSrc.start();
+
+    // Granular pad / choir: long soft-windowed grains retriggered on a randomized
+    // schedule short enough that several always overlap, giving a continuous
+    // shimmering "choir" texture instead of discrete notes.
+    let grainTimeoutId;
+    function scheduleGrain() {
+      const t = audioCtx.currentTime;
+      const freq = CHOIR_NOTES[Math.floor(Math.random() * CHOIR_NOTES.length)];
+      const dur = 2 + Math.random() * 2;
+      const osc = audioCtx.createOscillator();
+      osc.type = Math.random() < 0.5 ? "sine" : "triangle";
+      osc.frequency.value = freq * (1 + (Math.random() * 2 - 1) * 0.004);
+      const formant = audioCtx.createBiquadFilter();
+      formant.type = "bandpass";
+      formant.frequency.value = 900 + Math.random() * 500;
+      formant.Q.value = 1.5;
+      const pan = audioCtx.createStereoPanner();
+      pan.pan.value = Math.random() * 1.4 - 0.7;
+      const g = audioCtx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.05 + Math.random() * 0.03, t + dur * 0.35);
+      g.gain.linearRampToValueAtTime(0, t + dur);
+      osc.connect(formant); formant.connect(pan); pan.connect(g); g.connect(preFilter);
+      osc.start(t); osc.stop(t + dur + 0.05);
+      osc.onended = () => { osc.disconnect(); formant.disconnect(); pan.disconnect(); g.disconnect(); };
+      grainTimeoutId = setTimeout(scheduleGrain, 350 + Math.random() * 450);
+    }
+    scheduleGrain();
+
+    const slowFilter = audioCtx.createBiquadFilter();
+    slowFilter.type = "lowpass";
+    slowFilter.Q.value = 0.5;
+    const slowFilterCleanup = addWobble(slowFilter.frequency, 500, [
+      { rate: 0.02, depth: 220 }, { rate: 0.009, depth: 120, phaseOffset: 3.4 }
+    ]);
+    preFilter.connect(slowFilter);
+
+    // Huge shimmer reverb: two diffuse delay/feedback loops, with a rectifier
+    // octave-doubler tapped off the feedback and recirculated back in.
+    const delayA = audioCtx.createDelay(2.5); delayA.delayTime.value = 0.61;
+    const delayB = audioCtx.createDelay(2.5); delayB.delayTime.value = 0.83;
+    const fbFilterA = audioCtx.createBiquadFilter(); fbFilterA.type = "lowpass"; fbFilterA.frequency.value = 2500;
+    const fbFilterB = audioCtx.createBiquadFilter(); fbFilterB.type = "lowpass"; fbFilterB.frequency.value = 2200;
+    const fbGainA = audioCtx.createGain(); fbGainA.gain.value = 0.55;
+    const fbGainB = audioCtx.createGain(); fbGainB.gain.value = 0.5;
+
+    const shimmerTap = audioCtx.createGain(); shimmerTap.gain.value = 0.5;
+    const shimmerShaper = audioCtx.createWaveShaper();
+    shimmerShaper.curve = makeRectifierCurve();
+    const shimmerDcBlock = audioCtx.createBiquadFilter();
+    shimmerDcBlock.type = "highpass"; shimmerDcBlock.frequency.value = 150;
+    const shimmerTone = audioCtx.createBiquadFilter();
+    shimmerTone.type = "highshelf"; shimmerTone.frequency.value = 2500; shimmerTone.gain.value = 6;
+    const shimmerFeedback = audioCtx.createGain(); shimmerFeedback.gain.value = 0.3;
+
+    const wetGain = audioCtx.createGain(); wetGain.gain.value = 0.9;
+    const dryGain = audioCtx.createGain(); dryGain.gain.value = 0.45;
+
+    slowFilter.connect(delayA);
+    slowFilter.connect(delayB);
+    delayA.connect(fbFilterA); fbFilterA.connect(fbGainA); fbGainA.connect(delayA);
+    delayB.connect(fbFilterB); fbFilterB.connect(fbGainB); fbGainB.connect(delayB);
+
+    fbGainA.connect(shimmerTap);
+    shimmerTap.connect(shimmerShaper);
+    shimmerShaper.connect(shimmerDcBlock);
+    shimmerDcBlock.connect(shimmerTone);
+    shimmerTone.connect(shimmerFeedback);
+    shimmerFeedback.connect(delayA); // recirculate the octave-doubled energy
+    shimmerTone.connect(wetGain);    // and hear it immediately, not just after looping
+
+    delayA.connect(wetGain);
+    delayB.connect(wetGain);
+    slowFilter.connect(dryGain);
+
+    const mixGain = audioCtx.createGain();
+    wetGain.connect(mixGain);
+    dryGain.connect(mixGain);
+
+    // Tape saturation: gentle soft-clip + subtle wow/flutter + rolled-off highs.
+    const flutterDelay = audioCtx.createDelay(0.05);
+    flutterDelay.delayTime.value = 0.012;
+    const flutterCleanup = addWobble(flutterDelay.delayTime, 0.012, [
+      { rate: 0.4, depth: 0.0025 }, { rate: 0.65, depth: 0.0015, phaseOffset: 1.1 }
+    ]);
+    const tapeShaper = audioCtx.createWaveShaper();
+    tapeShaper.curve = makeTapeCurve(1.6);
+    tapeShaper.oversample = "4x";
+    const tapeTone = audioCtx.createBiquadFilter();
+    tapeTone.type = "lowpass"; tapeTone.frequency.value = 7500;
+
+    mixGain.connect(flutterDelay);
+    flutterDelay.connect(tapeShaper);
+    tapeShaper.connect(tapeTone);
+
+    // Stereo widener via mid/side: widen the side signal, then re-derive L/R.
+    const splitter = audioCtx.createChannelSplitter(2);
+    tapeTone.connect(splitter);
+
+    const midL = audioCtx.createGain(); midL.gain.value = 0.5;
+    const midR = audioCtx.createGain(); midR.gain.value = 0.5;
+    const midSum = audioCtx.createGain();
+    splitter.connect(midL, 0); splitter.connect(midR, 1);
+    midL.connect(midSum); midR.connect(midSum);
+
+    const sideL = audioCtx.createGain(); sideL.gain.value = 0.5;
+    const sideR = audioCtx.createGain(); sideR.gain.value = -0.5;
+    const sideSum = audioCtx.createGain();
+    splitter.connect(sideL, 0); splitter.connect(sideR, 1);
+    sideL.connect(sideSum); sideR.connect(sideSum);
+
+    const sideBoost = audioCtx.createGain(); sideBoost.gain.value = 1.6;
+    sideSum.connect(sideBoost);
+    const sideInv = audioCtx.createGain(); sideInv.gain.value = -1;
+    sideBoost.connect(sideInv);
+
+    const outL = audioCtx.createGain();
+    const outR = audioCtx.createGain();
+    midSum.connect(outL); sideBoost.connect(outL);
+    midSum.connect(outR); sideInv.connect(outR);
+
+    const merger = audioCtx.createChannelMerger(2);
+    outL.connect(merger, 0, 0);
+    outR.connect(merger, 0, 1);
+    merger.connect(out);
+
+    deepDrone = {
+      out, preFilter, subSine, subTri, subSineGain, subTriGain,
+      noiseSrc, noiseFilter, noiseGain,
+      slowFilter, slowFilterCleanup,
+      delayA, delayB, fbFilterA, fbFilterB, fbGainA, fbGainB,
+      shimmerTap, shimmerShaper, shimmerDcBlock, shimmerTone, shimmerFeedback,
+      wetGain, dryGain, mixGain,
+      flutterDelay, flutterCleanup, tapeShaper, tapeTone,
+      splitter, midL, midR, midSum, sideL, sideR, sideSum, sideBoost, sideInv, outL, outR, merger,
+      grainStop: () => clearTimeout(grainTimeoutId)
+    };
+
+    fadeGain(out.gain, sliderVals.drone * 0.8, 6);
+  }
+
+  function stopDeepDrone() {
+    if (!deepDrone) return;
+    const d = deepDrone;
+    fadeGain(d.out.gain, 0, 3);
+    setTimeout(() => {
+      d.grainStop();
+      try { d.subSine.stop(); } catch(e){}
+      try { d.subTri.stop(); } catch(e){}
+      try { d.noiseSrc.stop(); } catch(e){}
+      d.slowFilterCleanup();
+      d.flutterCleanup();
+      Object.keys(d).forEach(k => {
+        const n = d[k];
+        if (n && typeof n.disconnect === "function") { try { n.disconnect(); } catch(e){} }
+      });
+    }, 3200);
+    deepDrone = null;
   }
 
   // ---------------- Nature ambience ----------------
@@ -1006,6 +1228,7 @@
     startTone();
     startPad();
     startBinaural();
+    startDeepDrone();
 
     fadeGain(masterGain.gain, sliderVals.master, 2.5);
 
@@ -1022,6 +1245,7 @@
     stopTone();
     stopPad();
     stopBinaural();
+    stopDeepDrone();
     stopNature();
 
     startBtn.disabled = false;
@@ -1046,6 +1270,7 @@
   });
   bindSlider("slider-pad", "pad", 0.75, v => { if (pad) smoothSet(pad.out.gain, v); });
   bindSlider("slider-nature", "nature", 0.75, v => { if (natureGainNode.node) smoothSet(natureGainNode.node.gain, v); });
+  bindSlider("slider-drone", "drone", 0.8, v => { if (deepDrone) smoothSet(deepDrone.out.gain, v); });
   bindSlider("slider-master", "master", 1.0, v => { if (masterGain && isPlaying) smoothSet(masterGain.gain, v); });
 
   // ---------------- Binaural select ----------------
