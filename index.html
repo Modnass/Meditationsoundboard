@@ -277,23 +277,16 @@
     const sr = audioCtx.sampleRate;
     const len = sr * 4; // 4 seconds, looped
     const fadeSamples = Math.floor(sr * 0.05);
-
-    function applyLoopFade(data) {
-      for (let i = 0; i < fadeSamples; i++) {
-        const g = i / fadeSamples;
-        data[i] *= g;
-        data[len - 1 - i] *= g;
-      }
-    }
+    const genLen = len + fadeSamples; // a little extra tail used only for the loop crossfade
 
     function fillWhite(data) {
-      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
     }
 
     // Paul Kellet pink noise approximation
     function fillPink(data) {
       let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
-      for (let i = 0; i < len; i++) {
+      for (let i = 0; i < data.length; i++) {
         const w = Math.random() * 2 - 1;
         b0 = 0.99886*b0 + w*0.0555179;
         b1 = 0.99332*b1 + w*0.0750759;
@@ -310,21 +303,39 @@
     // brown noise via leaky integration
     function fillBrown(data) {
       let last = 0;
-      for (let i = 0; i < len; i++) {
+      for (let i = 0; i < data.length; i++) {
         const w = Math.random() * 2 - 1;
         last = (last + 0.02 * w) / 1.02;
         data[i] = last * 3.5;
       }
     }
 
+    // Makes a buffer loop seamlessly WITHOUT ever dipping toward silence at the
+    // seam: generate a bit past the loop point, then crossfade that extra tail
+    // into the head. Energy stays continuous through the loop instead of the
+    // old approach (fading both edges to zero), which produced an audible
+    // "cut out" every loop on every noise-based layer.
+    function makeLoopable(fillFn) {
+      const raw = new Float32Array(genLen);
+      fillFn(raw);
+      const out = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        if (i < fadeSamples) {
+          const t = i / fadeSamples;
+          out[i] = raw[i] * t + raw[len + i] * (1 - t);
+        } else {
+          out[i] = raw[i];
+        }
+      }
+      return out;
+    }
+
     // Stereo buffers: each channel gets its own independent random draw so the
     // noise is decorrelated L/R instead of a mono source panned center.
     function makeStereo(fillFn) {
       const buf = audioCtx.createBuffer(2, len, sr);
-      fillFn(buf.getChannelData(0));
-      fillFn(buf.getChannelData(1));
-      applyLoopFade(buf.getChannelData(0));
-      applyLoopFade(buf.getChannelData(1));
+      buf.copyToChannel(makeLoopable(fillFn), 0);
+      buf.copyToChannel(makeLoopable(fillFn), 1);
       return buf;
     }
 
